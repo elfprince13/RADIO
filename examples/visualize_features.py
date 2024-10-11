@@ -34,6 +34,9 @@ from datasets.distributed import split_dataset_by_node
 from common import rank_print, load_model, get_standard_transform, collate
 from radio.input_conditioner import InputConditioner
 
+from sklearn.manifold import TSNE
+import matplotlib.pyplot as plt
+
 try:
     import wandb
 except ImportError:
@@ -60,11 +63,17 @@ def main(rank: int = 0, world_size: int = 1):
     summary features to different view/augmentations of the same image.
     '''
 
-    local_rank = rank % torch.cuda.device_count()
-    torch.cuda.set_device(local_rank)
+    if torch.cuda.device_count() >= 1:
+        torch_accel = torch.cuda
+    elif torch.backends.mps.is_available() and torch.mps.device_count() >= 1:
+        torch_accel = torch.mps
+    else:
+        torch_accel = torch.cpu
+    local_rank = rank % (torch_accel.device_count() if 'device_count' in torch_accel.__dict__ else 1)
+    if 'set_device' in torch_accel.__dict__:
+        torch_accel.set_device(local_rank)
     cv2.setNumThreads(1)
-
-    device = torch.device('cuda', local_rank)
+    device = torch.device(torch_accel.__name__.split(".")[-1], local_rank)
     parser = argparse.ArgumentParser(description='Compute SSL embedding rank estimates')
     parser.add_argument('-v', '--model-version', default='radio_v2',
                         help='Which radio model to load.'
@@ -173,6 +182,8 @@ def main(rank: int = 0, world_size: int = 1):
     for d in dirs.values():
         os.makedirs(d, exist_ok=True)
 
+    tsne = TSNE(n_components=2)
+
     ctr = 0
     for batches in loader:
         if ctr >= args.n:
@@ -182,31 +193,31 @@ def main(rank: int = 0, world_size: int = 1):
             images = images.to(device=device, non_blocking=True)
 
             all_feat = []
-            with torch.autocast(device.type, dtype=torch.bfloat16):
-                p_images = preprocessor(images)
+            #with torch.autocast(device.type, dtype=torch.bfloat16):
+            p_images = preprocessor(images)
 
-                if args.intermediates:
-                    outputs = model.forward_intermediates(
-                        p_images,
-                        indices=args.intermediates,
-                        return_prefix_tokens=False,
-                        norm=False,
-                        stop_early=True,
-                        output_fmt='NLC',
-                        intermediates_only=True,
-                        aggregation=args.intermediate_aggregation,
-                    )
-                    assert args.adaptor_name is None
-                    all_feat = [o[1] for o in outputs]
+            if args.intermediates:
+                outputs = model.forward_intermediates(
+                    p_images,
+                    indices=args.intermediates,
+                    return_prefix_tokens=False,
+                    norm=False,
+                    stop_early=True,
+                    output_fmt='NLC',
+                    intermediates_only=True,
+                    aggregation=args.intermediate_aggregation,
+                )
+                assert args.adaptor_name is None
+                all_feat = [o[1] for o in outputs]
+            else:
+                output = model(p_images)
+                if args.adaptor_name:
+                    all_feat = [
+                        output['backbone'].features,
+                        output[args.adaptor_name].features,
+                    ]
                 else:
-                    output = model(p_images)
-                    if args.adaptor_name:
-                        all_feat = [
-                            output['backbone'].features,
-                            output[args.adaptor_name].features,
-                        ]
-                    else:
-                        all_feat = [output[1]]
+                    all_feat = [output[1]]
 
             if images.shape[-2] != images.shape[-1]:
                 num_rows = images.shape[-2] // patch_size
@@ -227,9 +238,11 @@ def main(rank: int = 0, world_size: int = 1):
 
             for i, feats in enumerate(all_feat):
                 colored = []
+                projected = []
                 for features in feats:
                     color = get_pca_map(features, images.shape[-2:], interpolation='bilinear')
                     colored.append(color)
+                    projected.append(tsne.fit_transform(features.reshape((-1,) + tuple(features.shape[-1:])).cpu()))
 
                 orig = cv2.cvtColor(images[i].permute(1, 2, 0).cpu().numpy(), cv2.COLOR_RGB2BGR)
 
@@ -241,10 +254,18 @@ def main(rank: int = 0, world_size: int = 1):
                     annotations = ["backbone"]
                     if args.adaptor_name is not None:
                         annotations.append(args.adaptor_name)
-                for annotation, img in zip(annotations, colored):
+                for annotation, img, projection in zip(annotations, colored, projected):
                     rdir = f'{dirs["viz"]}/{annotation}'
                     os.makedirs(rdir, exist_ok=True)
                     cv2.imwrite(f'{rdir}/vis_{ctr}.jpg', img * 255)
+                    fig = plt.figure()
+                    ax = fig.add_subplot(111)
+                    projection = projection - np.min(projection, axis=0)
+                    projection = projection / np.max(projection, axis=0)
+                    img = img[(patch_size//2)::patch_size,(patch_size//2)::patch_size,:].reshape((-1, 3))
+                    ax.scatter(projection[:,0], projection[:, 1], c=img, label=annotation)
+                    ax.legend(loc='best')
+                    plt.savefig(f'{rdir}/vis_tsne_{ctr}.png')
 
                 # Create an image grid with the original image and the colored feature maps.
                 grid_image = create_image_grid_with_annotations(
