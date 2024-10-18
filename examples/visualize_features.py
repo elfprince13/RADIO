@@ -37,14 +37,26 @@ from radio.input_conditioner import InputConditioner
 from sklearn.manifold import TSNE
 import matplotlib.pyplot as plt
 
+from hflayers import Hopfield
+
+from sklearn.cluster import KMeans
+
 try:
     import wandb
 except ImportError:
     wandb = None
 
+Image.MAX_IMAGE_PIXELS = None
 
 LAYER_STATS = dict()
 
+def make_hop(beta):
+    return Hopfield(scaling = beta,
+                    state_pattern_as_static=True, stored_pattern_as_static=True, pattern_projection_as_static=True,
+                    normalize_stored_pattern=False, normalize_stored_pattern_affine=False,
+                    normalize_state_pattern=False, normalize_state_pattern_affine=False,
+                    normalize_pattern_projection=False, normalize_pattern_projection_affine=False,
+                    disable_out_projection=True)
 
 def parse_int_list(string):
     """Parse a comma-separated list of integers and sort them."""
@@ -124,6 +136,17 @@ def main(rank: int = 0, world_size: int = 1):
     np.random.seed(42 + rank)
     random.seed(42 + rank)
 
+    ## experiment to see if double precision helps convergence in the hopfield network
+    ## signs point to: it doesn't
+    # try:
+    #     torch.tensor([1,2,3]).to(device=device).double()
+    #     double_device = device
+    # except TypeError:
+    #     print("Warning! No hardware accelerated double support...")
+    #     double_device = torch.device('cpu', 1)
+    # hop_device = double_device
+    hop_device = device
+    hop = make_hop(8192.0).to(device=hop_device).eval()
     rank_print(f'Loading model: "{args.model_version}", ViTDet: {args.vitdet_window_size}, Adaptor: "{args.adaptor_name}", Resolution: {args.resolution}, Max: {args.max_dim}...')
     model, preprocessor, info = load_model(args.model_version, vitdet_window_size=args.vitdet_window_size, adaptor_names=args.adaptor_name,
                                            torchhub_repo=args.torchhub_repo)
@@ -240,9 +263,53 @@ def main(rank: int = 0, world_size: int = 1):
                 colored = []
                 projected = []
                 for features in feats:
-                    color = get_pca_map(features, images.shape[-2:], interpolation='bilinear')
+                    print("features shape: ", features.shape)
+                    if torch.any(torch.isnan(features)):
+                        print("nans in features")
+                        continue  
+                    # expecting an implicit single batch
+                    assert len(features.shape) == 3
+                    n_batches = 1 
+                    n_chan = features.shape[-1]
+                    print(f"n_batches = {n_batches}, n_chan = {n_chan}, len(features.shape) = {len(features.shape)}")
+                    print(f"features range: [{torch.min(features)}, {torch.max(features)}]")
+                    scale = torch.maximum(torch.abs(torch.min(features)),torch.abs(torch.max(features))) * (n_chan ** 0.5)
+                    features_flat = features.reshape((n_batches, -1, n_chan))
+                    ## TOGGLE THE EOL COMMENT BELOW if you want to use double_device codepath above
+                    features_pre_normed = (features_flat / scale).to(device=hop_device)#.double()
+                    print("features_pre_normed shape: ", features_pre_normed.shape)
+                    features_normed =  torch.concat([features_pre_normed, torch.sqrt(1 - torch.sum(features_pre_normed * features_pre_normed, axis=-1)).unsqueeze(-1)],axis=-1)
+                    print("features_normed shape: ", features_normed.shape)
+                    if torch.any(torch.isnan(features_normed)):
+                        print("nans in features normed")
+                        continue
+                    MAX_HOP_ITERATIONS = 100
+                    remaining_iterations = MAX_HOP_ITERATIONS
+                    while remaining_iterations > 0:
+                        new_features_normed = hop((features_normed, features_normed, features_normed))
+                        delta = torch.abs(features_normed - new_features_normed)
+                        max_delta = torch.max(delta)
+                        print(f"delta = {max_delta}")
+                        features_normed = new_features_normed
+                        del new_features_normed
+                        if max_delta < 1e-8:
+                            break
+                        remaining_iterations -= 1
+                    round_to = abs(round(math.log(max_delta) / math.log(10)))
+                    print(f"rounding to {round_to} decimals after {MAX_HOP_ITERATIONS - remaining_iterations} iterations")
+                    hop_features = (scale * features_normed[...,:-1].round(decimals=round_to).reshape(features.shape).float().to(device=device))
+                    print("hop_features shape: ", hop_features.shape)
+                    print(hop_features)
+                    if torch.any(torch.isnan(hop_features)):
+                        print("nans in hop features")
+                        continue
+                    cluster_count = len(set([tuple(feat.cpu().numpy()) for row in hop_features for feat in row]))
+                    print(f"cluster_count after convergence: {cluster_count}")
+                    color = get_pca_map(hop_features.cpu(), images.shape[-2:], interpolation='nearest')
+                    #color = get_cluster_map(hop_features.cpu(), images.shape[-2:], num_clusters=cluster_count)#interpolation='nearest')
+                    #print(f"PCA Stats: {stats}")
                     colored.append(color)
-                    projected.append(tsne.fit_transform(features.reshape((-1,) + tuple(features.shape[-1:])).cpu()))
+                    projected.append(tsne.fit_transform(hop_features.reshape((-1,) + tuple(hop_features.shape[-1:])).cpu()))
 
                 orig = cv2.cvtColor(images[i].permute(1, 2, 0).cpu().numpy(), cv2.COLOR_RGB2BGR)
 
@@ -337,7 +404,7 @@ def get_pca_map(
     else:
         reduct_mat, color_min, color_max = pca_stats
     pca_color = feature_map @ reduct_mat
-    pca_color = (pca_color - color_min) / (color_max - color_min)
+    pca_color = (pca_color - color_min) / torch.maximum((color_max - color_min), 0.00001 * torch.ones_like(color_min))
     pca_color = pca_color.clamp(0, 1)
     pca_color = F.interpolate(
         pca_color.permute(0, 3, 1, 2),
@@ -425,13 +492,13 @@ def get_cluster_map(
     img_size,
     num_clusters=10,
 ) -> torch.Tensor:
-    kmeans = KMeans(n_clusters=num_clusters, distance=CosineSimilarity, verbose=False)
+    kmeans = KMeans(n_clusters=num_clusters, verbose=False)
     if feature_map.shape[0] != 1:
         # make it (1, h, w, C)
         feature_map = feature_map[None]
-    labels = kmeans.fit_predict(
-        feature_map.reshape(1, -1, feature_map.shape[-1])
-    ).float()
+    labels = torch.tensor(kmeans.fit_predict(
+        feature_map.reshape(-1, feature_map.shape[-1])
+    )).float()
     labels = (
         F.interpolate(
             labels.reshape(1, *feature_map.shape[:-1]), size=img_size, mode="nearest"
