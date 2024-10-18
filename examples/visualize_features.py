@@ -260,10 +260,13 @@ def main(rank: int = 0, world_size: int = 1):
 
             # b m h w c
             all_feat = list(zip(*all_feat))
+            kron_kernel = torch.ones((patch_size, patch_size), dtype=torch.int32)
 
             for i, feats in enumerate(all_feat):
                 colored = []
                 projected = []
+                resampled = []
+                resampled_small = []
                 for features in feats:
                     if torch.any(torch.isnan(features)):
                         rank_print("nans in features")
@@ -284,29 +287,58 @@ def main(rank: int = 0, world_size: int = 1):
                         continue
                     MAX_HOP_ITERATIONS = 100
                     remaining_iterations = MAX_HOP_ITERATIONS
-                    while remaining_iterations > 0:
-                        new_features_normed = hop((features_normed, features_normed, features_normed))
-                        delta = torch.abs(features_normed - new_features_normed)
-                        max_delta = torch.max(delta)
-                        rank_print(f"delta = {max_delta}")
-                        features_normed = new_features_normed
-                        del new_features_normed
-                        if max_delta < 1e-8:
-                            break
-                        remaining_iterations -= 1
+                    with tqdm(total=MAX_HOP_ITERATIONS) as pbar_max:
+                        while remaining_iterations > 0:
+                            new_features_normed = hop((features_normed, features_normed, features_normed))
+                            delta = torch.abs(features_normed - new_features_normed)
+                            max_delta = torch.max(delta)
+                            features_normed = new_features_normed
+                            del new_features_normed
+                            pbar_max.update(1)
+                            pbar_max.set_postfix(delta=max_delta)
+                            if max_delta < (10**-8):
+                                break
+                            remaining_iterations -= 1
                     round_to = abs(round(math.log(max_delta) / math.log(10)))
                     rank_print(f"rounding to {round_to} decimals after {MAX_HOP_ITERATIONS - remaining_iterations} iterations")
                     hop_features = (scale * features_normed[...,:-1].round(decimals=round_to).reshape(features.shape).float().to(device=device))
                     if torch.any(torch.isnan(hop_features)):
                         rank_print("nans in hop features")
                         continue
-                    cluster_count = len(set([tuple(feat.cpu().numpy()) for row in hop_features for feat in row]))
+                    cluster_count = 0
+                    cluster_feats = {}
+                    pseudolabels = []
+                    # TODO: can we JIT this?
+                    for row in hop_features:
+                        for feat in row:
+                            cluster_id = cluster_feats.setdefault(tuple(feat.cpu().numpy()), cluster_count)
+                            if cluster_id == cluster_count:
+                                cluster_count += 1
+                            pseudolabels.append(cluster_id)
                     rank_print(f"cluster_count after convergence: {cluster_count}")
+                    pseudolabels = torch.tensor(pseudolabels, dtype=torch.int32).reshape(features.shape[:-1])
+                    pseudolabels_big = torch.kron(pseudolabels, kron_kernel)
+                    input_colors = []
+                    for j in tqdm(range(cluster_count), desc="Extracting representative pixels for clusters"):
+                        mask2d = (pseudolabels_big == j)
+                        # input images are channel x h x w
+                        masked_pixels = images[torch.stack([mask2d, mask2d, mask2d])[None]].reshape([3, -1])
+                        # skew the distribution higher than median to remove shadow while still hopefully avoiding
+                        # outlying glare
+                        repr_color = torch.quantile(masked_pixels,0.97,dim=1)
+                        input_colors.append(repr_color)
                     color = get_pca_map(hop_features.cpu(), images.shape[-2:], interpolation='nearest')
                     #color = get_cluster_map(hop_features.cpu(), images.shape[-2:], num_clusters=cluster_count)#interpolation='nearest')
                     #print(f"PCA Stats: {stats}")
                     colored.append(color)
                     projected.append(tsne.fit_transform(hop_features.reshape((-1,) + tuple(hop_features.shape[-1:])).cpu()))
+                    input_colors = torch.stack(input_colors)
+                    pseudolabels_big = pseudolabels_big.reshape(-1).to(device=device)
+                    pseudolabels = pseudolabels.reshape(-1).to(device=device)
+                    resamp = torch.index_select(input_colors, 0, pseudolabels_big).reshape(tuple(images.shape[-2:]) + (3,))
+                    resampled.append(resamp)
+                    resamp_small = torch.index_select(input_colors, 0, pseudolabels).reshape(tuple(features.shape[:-1]) + (3,))
+                    resampled_small.append(resamp_small)#F.interpolate(resamp_small, scale_factor=torch.tensor([1, patch_size, patch_size, 1]), mode='bilinear'))
 
                 orig = cv2.cvtColor(images[i].permute(1, 2, 0).cpu().numpy(), cv2.COLOR_RGB2BGR)
 
@@ -318,7 +350,7 @@ def main(rank: int = 0, world_size: int = 1):
                     annotations = ["backbone"]
                     if args.adaptor_name is not None:
                         annotations.append(args.adaptor_name)
-                for annotation, img, projection in zip(annotations, colored, projected):
+                for annotation, img, projection, resample, res_small in zip(annotations, colored, projected, resampled, resampled_small):
                     rdir = f'{dirs["viz"]}/{annotation}'
                     os.makedirs(rdir, exist_ok=True)
                     cv2.imwrite(f'{rdir}/vis_{ctr}.jpg', img * 255)
@@ -330,6 +362,11 @@ def main(rank: int = 0, world_size: int = 1):
                     ax.scatter(projection[:,0], projection[:, 1], c=img, label=annotation)
                     ax.legend(loc='best')
                     plt.savefig(f'{rdir}/vis_tsne_{ctr}.png')
+
+                    resample = cv2.cvtColor(resample.cpu().numpy(), cv2.COLOR_RGB2BGR)
+                    cv2.imwrite(f'{rdir}/vis_repr_{ctr}.png', resample * 255)
+                    res_small = cv2.cvtColor(res_small.cpu().numpy(), cv2.COLOR_RGB2BGR)
+                    cv2.imwrite(f'{rdir}/vis_repr_s_{ctr}.png', res_small * 255)
 
                 # Create an image grid with the original image and the colored feature maps.
                 grid_image = create_image_grid_with_annotations(
