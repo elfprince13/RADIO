@@ -254,6 +254,8 @@ def main(rank: int = 0, world_size: int = 1):
                 rearrange(f, 'b (h w) c -> b h w c', h=num_rows, w=num_cols).float()
                 for f in all_feat
             ]
+
+            #print(f"all feat shape: {[t.shape for t in all_feat]}")
             # all_feat = rearrange(all_feat, 'b m (h w) c -> b m h w c', h=num_rows, w=num_cols).float()
 
             # b m h w c
@@ -263,25 +265,22 @@ def main(rank: int = 0, world_size: int = 1):
                 colored = []
                 projected = []
                 for features in feats:
-                    print("features shape: ", features.shape)
                     if torch.any(torch.isnan(features)):
-                        print("nans in features")
+                        rank_print("nans in features")
                         continue  
                     # expecting an implicit single batch
                     assert len(features.shape) == 3
                     n_batches = 1 
                     n_chan = features.shape[-1]
-                    print(f"n_batches = {n_batches}, n_chan = {n_chan}, len(features.shape) = {len(features.shape)}")
-                    print(f"features range: [{torch.min(features)}, {torch.max(features)}]")
+                    rank_print(f"n_batches = {n_batches}, n_chan = {n_chan}, len(features.shape) = {len(features.shape)}")
+                    rank_print(f"features range: [{torch.min(features)}, {torch.max(features)}]")
                     scale = torch.maximum(torch.abs(torch.min(features)),torch.abs(torch.max(features))) * (n_chan ** 0.5)
                     features_flat = features.reshape((n_batches, -1, n_chan))
                     ## TOGGLE THE EOL COMMENT BELOW if you want to use double_device codepath above
                     features_pre_normed = (features_flat / scale).to(device=hop_device)#.double()
-                    print("features_pre_normed shape: ", features_pre_normed.shape)
                     features_normed =  torch.concat([features_pre_normed, torch.sqrt(1 - torch.sum(features_pre_normed * features_pre_normed, axis=-1)).unsqueeze(-1)],axis=-1)
-                    print("features_normed shape: ", features_normed.shape)
                     if torch.any(torch.isnan(features_normed)):
-                        print("nans in features normed")
+                        rank_print("nans in features normed")
                         continue
                     MAX_HOP_ITERATIONS = 100
                     remaining_iterations = MAX_HOP_ITERATIONS
@@ -289,22 +288,20 @@ def main(rank: int = 0, world_size: int = 1):
                         new_features_normed = hop((features_normed, features_normed, features_normed))
                         delta = torch.abs(features_normed - new_features_normed)
                         max_delta = torch.max(delta)
-                        print(f"delta = {max_delta}")
+                        rank_print(f"delta = {max_delta}")
                         features_normed = new_features_normed
                         del new_features_normed
                         if max_delta < 1e-8:
                             break
                         remaining_iterations -= 1
                     round_to = abs(round(math.log(max_delta) / math.log(10)))
-                    print(f"rounding to {round_to} decimals after {MAX_HOP_ITERATIONS - remaining_iterations} iterations")
+                    rank_print(f"rounding to {round_to} decimals after {MAX_HOP_ITERATIONS - remaining_iterations} iterations")
                     hop_features = (scale * features_normed[...,:-1].round(decimals=round_to).reshape(features.shape).float().to(device=device))
-                    print("hop_features shape: ", hop_features.shape)
-                    print(hop_features)
                     if torch.any(torch.isnan(hop_features)):
-                        print("nans in hop features")
+                        rank_print("nans in hop features")
                         continue
                     cluster_count = len(set([tuple(feat.cpu().numpy()) for row in hop_features for feat in row]))
-                    print(f"cluster_count after convergence: {cluster_count}")
+                    rank_print(f"cluster_count after convergence: {cluster_count}")
                     color = get_pca_map(hop_features.cpu(), images.shape[-2:], interpolation='nearest')
                     #color = get_cluster_map(hop_features.cpu(), images.shape[-2:], num_clusters=cluster_count)#interpolation='nearest')
                     #print(f"PCA Stats: {stats}")
