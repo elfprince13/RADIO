@@ -34,6 +34,7 @@ from datasets.distributed import split_dataset_by_node
 from common import rank_print, load_model, get_standard_transform, collate
 from radio.input_conditioner import InputConditioner
 
+from sklearn_extra.cluster import CLARA
 from sklearn.manifold import TSNE
 import matplotlib.pyplot as plt
 
@@ -206,6 +207,13 @@ def main(rank: int = 0, world_size: int = 1):
         os.makedirs(d, exist_ok=True)
 
     tsne = TSNE(n_components=2)
+    def unit_vec_angular_distance(x, y):
+        # technically not angular distance,
+        # but equivalent up to a scale factor of pi
+        # and we really just need something that's metric
+        return np.arccos(np.clip(x @ y, -1.0, 1.0))
+    # dumb hack to just get a single approximate medoid
+    clara = CLARA(n_clusters=1, metric=unit_vec_angular_distance, max_iter=0)
 
     ctr = 0
     for batches in loader:
@@ -322,11 +330,21 @@ def main(rank: int = 0, world_size: int = 1):
                     for j in tqdm(range(cluster_count), desc="Extracting representative pixels for clusters"):
                         mask2d = (pseudolabels_big == j)
                         # input images are channel x h x w
-                        masked_pixels = images[torch.stack([mask2d, mask2d, mask2d])[None]].reshape([3, -1])
+                        masked_pixels = images[torch.stack([mask2d, mask2d, mask2d])[None]].reshape([3, -1]).transpose(0,1)
+                        masked_pixel_lens = torch.sqrt(torch.sum(masked_pixels * masked_pixels, dim=-1, keepdims=True))
+                        normed_pixels = masked_pixels / masked_pixel_lens
+
+                        clara.fit(normed_pixels.cpu())
+                        median_color = cv2.cvtColor(clara.cluster_centers_[0][None,None].astype(np.float32), cv2.COLOR_RGB2HSV)
+                        
+                        hsv_pixels = cv2.cvtColor(masked_pixels.cpu().numpy()[None], cv2.COLOR_RGB2HSV)
+
                         # skew the distribution higher than median to remove shadow while still hopefully avoiding
                         # outlying glare
-                        repr_color = torch.quantile(masked_pixels,0.97,dim=1)
-                        input_colors.append(repr_color)
+                        repr_intensity = np.quantile(hsv_pixels[:,:,-1],0.97)
+                        median_color[...,-1] = repr_intensity
+                        repr_color = cv2.cvtColor(median_color, cv2.COLOR_HSV2RGB)
+                        input_colors.append(torch.tensor(repr_color.squeeze()).to(device=device))
                     color = get_pca_map(hop_features.cpu(), images.shape[-2:], interpolation='nearest')
                     #color = get_cluster_map(hop_features.cpu(), images.shape[-2:], num_clusters=cluster_count)#interpolation='nearest')
                     #print(f"PCA Stats: {stats}")
